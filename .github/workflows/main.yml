@@ -58,4 +58,81 @@ jobs:
 
       # 6. Configure AWS credentials (OIDC)
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: eu-north-1
+
+      # DEBUG: AWS identity & ECR access
+      - name: Debug AWS identity
+        run: |
+          echo "=== AWS STS GET CALLER IDENTITY ==="
+          aws sts get-caller-identity || echo "Kunde inte hämta caller identity"
+
+          echo "=== AWS REGION ==="
+          aws configure get region || echo "Ingen region satt"
+
+          echo "=== LIST ECR REPOS ==="
+          aws ecr describe-repositories || echo "Kunde inte lista ECR"
+
+      # 7. Login to ECR
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # DEBUG: Docker & ECR status
+      - name: Debug Docker environment
+        run: |
+          echo "=== DOCKER INFO ==="
+          docker info || echo "Docker info fail"
+
+          echo "=== DOCKER IMAGES ==="
+          docker images || echo "Inga images"
+
+          echo "=== CHECK ECR LOGIN ==="
+          aws ecr get-login-password --region eu-north-1 > /dev/null && echo "ECR login OK" || echo "ECR login FAIL"
+
+      # 8. Build & tag Docker image
+      - name: Build Docker image
+        run: |
+          IMAGE_URI=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.eu-north-1.amazonaws.com/myapp:latest
+          docker build -t $IMAGE_URI .
+          echo "IMAGE_URI=$IMAGE_URI" >> $GITHUB_ENV
+
+      # 9. Push Docker image
+      - name: Push Docker image
+        run: docker push $IMAGE_URI
+
+      # 10. Render new ECS task definition
+      - name: Render new task definition
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: ecs-task.json
+          container-name: myapp
+          image: ${{ env.IMAGE_URI }}
+
+      # 11. Deploy to ECS
+      - name: Deploy to ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: myapp-service
+          cluster: myapp-cluster
+          wait-for-service-stability: true
+
+      # DEBUG: ECS service & task status
+      - name: Debug ECS service status
+        run: |
+          echo "=== ECS SERVICE STATUS ==="
+          aws ecs describe-services \
+            --cluster myapp-cluster \
+            --services myapp-service
+
+          echo "=== ECS TASKS ==="
+          aws ecs list-tasks \
+            --cluster myapp-cluster \
+            --service-name myapp-service
+
+          echo "=== ECS TASK DETAILS ==="
+          TASK_ARN=$(aws ecs list-tasks --cluster myapp-cluster --service-name myapp-service --query 'taskArns[0]' --output text)
+          aws ecs describe-tasks --cluster myapp-cluster --tasks $TASK_ARN

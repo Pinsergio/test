@@ -1,8 +1,12 @@
-name: CI/CD Pipeline (AWS + Docker + ECS)
+name: CI/CD Pipeline (AWS + Docker + ECS, multi-env, rollback)
 
 on:
   push:
-    branches: [ master ]
+    branches: [ dev, stage, master ]  # dev = utveckling, stage = test, master = prod
+
+env:
+  AWS_REGION: eu-north-1
+  ECR_REPO_NAME: myapp
 
 jobs:
   build-and-deploy:
@@ -11,6 +15,11 @@ jobs:
     permissions:
       contents: read
       id-token: write
+
+    env:
+      ENVIRONMENT: ${{ github.ref_name }} # dev / stage / master
+      ECS_CLUSTER: myapp-cluster-${{ github.ref_name }}
+      ECS_SERVICE: myapp-service-${{ github.ref_name }}
 
     steps:
       # 1. Checkout
@@ -61,7 +70,7 @@ jobs:
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: eu-north-1
+          aws-region: ${{ env.AWS_REGION }}
 
       # DEBUG: AWS identity & ECR access
       - name: Debug AWS identity
@@ -89,50 +98,74 @@ jobs:
           docker images || echo "Inga images"
 
           echo "=== CHECK ECR LOGIN ==="
-          aws ecr get-login-password --region eu-north-1 > /dev/null && echo "ECR login OK" || echo "ECR login FAIL"
+          aws ecr get-login-password --region ${{ env.AWS_REGION }} > /dev/null && echo "ECR login OK" || echo "ECR login FAIL"
 
       # 8. Build & tag Docker image
       - name: Build Docker image
         run: |
-          IMAGE_URI=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.eu-north-1.amazonaws.com/myapp:latest
+          IMAGE_URI=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPO_NAME }}:${{ github.sha }}
           docker build -t $IMAGE_URI .
           echo "IMAGE_URI=$IMAGE_URI" >> $GITHUB_ENV
 
       # 9. Push Docker image
       - name: Push Docker image
-        run: docker push $IMAGE_URI
+        run: docker push ${{ env.IMAGE_URI }}
 
-      # 10. Render new ECS task definition
+      # 10. Spara nuvarande task definition (för rollback)
+      - name: Capture current task definition
+        id: current-task-def
+        run: |
+          CURRENT_TASK_DEF=$(aws ecs describe-services \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --services ${{ env.ECS_SERVICE }} \
+            --query 'services[0].taskDefinition' \
+            --output text)
+          echo "PREVIOUS_TASK_DEF=$CURRENT_TASK_DEF" >> $GITHUB_ENV
+          echo "Current task def: $CURRENT_TASK_DEF"
+
+      # 11. Render new ECS task definition (per miljö)
       - name: Render new task definition
         id: task-def
         uses: aws-actions/amazon-ecs-render-task-definition@v1
         with:
-          task-definition: ecs-task.json
+          task-definition: ecs-task-${{ env.ENVIRONMENT }}.json
           container-name: myapp
           image: ${{ env.IMAGE_URI }}
 
-      # 11. Deploy to ECS
+      # 12. Deploy to ECS
       - name: Deploy to ECS
+        id: ecs-deploy
         uses: aws-actions/amazon-ecs-deploy-task-definition@v1
         with:
           task-definition: ${{ steps.task-def.outputs.task-definition }}
-          service: myapp-service
-          cluster: myapp-cluster
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
           wait-for-service-stability: true
+
+      # 13. Rollback om deployen inte blir stabil
+      - name: Conditional rollback on failed deploy
+        if: failure()
+        run: |
+          echo "=== ROLLBACK TRIGGERED ==="
+          echo "Rolling back to $PREVIOUS_TASK_DEF"
+          aws ecs update-service \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service ${{ env.ECS_SERVICE }} \
+            --task-definition $PREVIOUS_TASK_DEF
 
       # DEBUG: ECS service & task status
       - name: Debug ECS service status
         run: |
           echo "=== ECS SERVICE STATUS ==="
           aws ecs describe-services \
-            --cluster myapp-cluster \
-            --services myapp-service
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --services ${{ env.ECS_SERVICE }}
 
           echo "=== ECS TASKS ==="
           aws ecs list-tasks \
-            --cluster myapp-cluster \
-            --service-name myapp-service
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service-name ${{ env.ECS_SERVICE }}
 
           echo "=== ECS TASK DETAILS ==="
-          TASK_ARN=$(aws ecs list-tasks --cluster myapp-cluster --service-name myapp-service --query 'taskArns[0]' --output text)
-          aws ecs describe-tasks --cluster myapp-cluster --tasks $TASK_ARN
+          TASK_ARN=$(aws ecs list-tasks --cluster ${{ env.ECS_CLUSTER }} --service-name ${{ env.ECS_SERVICE }} --query 'taskArns[0]' --output text)
+          aws ecs describe-tasks --cluster ${{ env.ECS_CLUSTER }} --tasks $TASK_ARN
